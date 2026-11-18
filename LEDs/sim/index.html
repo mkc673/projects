@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bike LEDs — FastLED WASM Simulator</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div id="statusDot" class="status-dot" title="WASM runtime status"></div>
+      <div>
+        <h1>Load 75 Cargo Bike — FastLED WebAssembly Simulator</h1>
+        <div id="statusText" class="subtitle">Loading compiled firmware (led_sim.wasm)…</div>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <label class="toggle-label" style="margin-right: 6px;">
+        Layout:
+        <select id="layoutSelect">
+          <option value="bike">Load 75 View (Top-Down)</option>
+          <option value="strips">Parallel Strips (0–143)</option>
+        </select>
+      </label>
+
+      <label class="toggle-label" style="margin-right: 6px;">
+        <input type="checkbox" id="flipDirection" />
+        Flip LED 0↔143
+      </label>
+
+      <label class="toggle-label" style="margin-right: 6px;">
+        Speed:
+        <select id="speedSelect">
+          <option value="0.25">0.25×</option>
+          <option value="0.5">0.5×</option>
+          <option value="1" selected>1.0× (Real-time)</option>
+          <option value="2">2.0×</option>
+        </select>
+      </label>
+
+      <button id="playPauseBtn" title="Shortcut: Space">⏸ Pause</button>
+      <button id="stepBtn" title="Advance 20ms (1 FastLED frame)">⏭ +20ms</button>
+      <button id="resetBtn" title="Shortcut: R">↺ Reset MCU</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <div class="card-header">
+        <span class="card-title">Front Box WS2815 Strips (2×144) + Rear Rack &lt; &gt; Turn Strips</span>
+        <span style="font-size: 0.78rem; color: var(--muted);">
+          Box Left: <code>D6</code> · Box Right: <code>D4</code> · Rear Rack <code>&lt;</code> / <code>&gt;</code>: <code>D9 / D10</code>
+        </span>
+      </div>
+
+      <div class="canvas-wrap">
+        <canvas id="ledCanvas"></canvas>
+      </div>
+
+      <div class="controls-bar">
+        <button id="leftTurnBtn" class="hw-btn turn-btn" type="button">
+          <span class="btn-main">⬅ Left Turn Signal <span class="kbd">A</span> / <span class="kbd">←</span></span>
+          <span class="btn-meta">Pin D2 (INPUT_PULLUP → LOW)</span>
+        </button>
+
+        <button id="hallBtn" class="hw-btn sensor-btn" type="button">
+          <span class="btn-main">🧲 Hall Magnet Sensor <span class="kbd">M</span></span>
+          <span class="btn-meta" id="hallBtnMeta">Pin D7 · Hold or click to latch</span>
+        </button>
+
+        <button id="rightTurnBtn" class="hw-btn turn-btn" type="button">
+          <span class="btn-main">Right Turn Signal ➡ <span class="kbd">D</span> / <span class="kbd">→</span></span>
+          <span class="btn-meta">Pin D3 (INPUT_PULLUP → LOW)</span>
+        </button>
+      </div>
+    </section>
+
+    <aside class="side-col">
+      <section class="card">
+        <div class="card-header">
+          <span class="card-title">MCU &amp; GPIO Telemetry</span>
+          <label class="toggle-label">
+            <input type="checkbox" id="hallLatchToggle" />
+            Latch Magnet
+          </label>
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat-box">
+            <div class="stat-label">Simulated millis()</div>
+            <div id="statMillis" class="stat-value">0 ms</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-label">FastLED Brightness</div>
+            <div id="statBrightness" class="stat-value">255 / 255</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-label">FastLED.show() Rate</div>
+            <div id="statShowHz" class="stat-value">0 Hz</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-label">Latched Frames</div>
+            <div id="statFrames" class="stat-value">0</div>
+          </div>
+        </div>
+
+        <div class="pins-list">
+          <div class="pin-row">
+            <span class="pin-name"><span class="pin-badge">D2</span> Left Turn Button</span>
+            <span id="pinD2" class="pin-val high">HIGH (Idle)</span>
+          </div>
+          <div class="pin-row">
+            <span class="pin-name"><span class="pin-badge">D3</span> Right Turn Button</span>
+            <span id="pinD3" class="pin-val high">HIGH (Idle)</span>
+          </div>
+          <div class="pin-row">
+            <span class="pin-name"><span class="pin-badge">D7</span> Hall Sensor</span>
+            <span id="pinD7" class="pin-val high">HIGH (No magnet)</span>
+          </div>
+          <div class="pin-row">
+            <span class="pin-name"><span class="pin-badge">D9</span> Rear Left Transistor</span>
+            <span id="pinD9" class="pin-val high">PWM 0 (0%)</span>
+          </div>
+          <div class="pin-row">
+            <span class="pin-name"><span class="pin-badge">D10</span> Rear Right Transistor</span>
+            <span id="pinD10" class="pin-val high">PWM 0 (0%)</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="card" style="flex: 1;">
+        <div class="card-header">
+          <span class="card-title">Serial Monitor (9600 baud)</span>
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <label class="toggle-label">
+              <input type="checkbox" id="collapseSerial" checked />
+              Group repeats
+            </label>
+            <button id="clearSerialBtn" style="padding: 3px 8px; font-size: 0.75rem;">Clear</button>
+          </div>
+        </div>
+        <div id="serialLog" class="serial-log"></div>
+      </section>
+    </aside>
+  </main>
+
+  <script src="dist/led_sim.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
