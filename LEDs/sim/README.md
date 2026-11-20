@@ -21,7 +21,7 @@ Whenever you edit `src/main.cpp` or any header in `src/`, re-run `./sim/build.sh
 |---|---|---|---|
 | **Left Turn Signal** | `A` or `←` | `D2` (`INPUT_PULLUP`) | Pulls `D2` `LOW` through `TurnSignalButton` (50ms debounce) |
 | **Right Turn Signal** | `D` or `→` | `D3` (`INPUT_PULLUP`) | Pulls `D3` `LOW` through `TurnSignalButton` (50ms debounce) |
-| **Hall Magnet Sensor** | `M` | `D7` (`INPUT_PULLUP`) | Pulls `D7` `LOW` while held (or toggled with **Latch Magnet**) |
+| **Rear Wheel Speed Slider** | — | `D7` (`INPUT_PULLUP`) | Spins the 26" rear wheel (`0–30 mph`) and pulses `D7` `LOW` on each spoke-magnet pass |
 | **Left WS2815 Strip** | — | `D6` | 144 GRB pixels latched via `FastLED.show()` |
 | **Right WS2815 Strip** | — | `D4` | 144 GRB pixels latched via `FastLED.show()` |
 | **Rear Transistors** | — | `D9` / `D10` | Displays `analogWrite()` PWM duty cycle (`0–255`) |

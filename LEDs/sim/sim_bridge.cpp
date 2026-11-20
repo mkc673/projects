@@ -1,10 +1,15 @@
 #include <Arduino.h>
+#include <algorithm>
+#include <cmath>
 #include <emscripten.h>
 #include <string>
+
+#include "wheel_speed.h"
 
 // Declarations from src/main.cpp
 extern void setup();
 extern void loop();
+extern WheelSpeedSensor wheelSpeed;
 
 SimSerialPort SimSerial;
 
@@ -31,6 +36,54 @@ int g_strip_len[MAX_PINS] = {0};
 double g_sim_time_ms = 0.0;
 uint32_t g_show_count = 0;
 std::string g_serial_line_buf;
+
+// Simulated 26" rear wheel spoke magnet (radius = 200mm, tire outer radius = 335mm)
+constexpr int HALL_SENSOR_PIN = 7;
+constexpr double WHEEL_CIRCUMFERENCE_M = 2.0 * 3.14159265358979323846 * 0.335;
+constexpr double MPH_TO_MPS = 0.44704;
+// ~18mm effective Hall trigger arc along the 2*pi*200mm (1256.6mm) spoke magnet path
+constexpr double MAGNET_TRIGGER_ARC_FRAC = 18.0 / (2.0 * 3.14159265358979323846 * 200.0);
+// Realistic cargo bike acceleration & braking rates
+constexpr double MAX_ACCEL_MPH_PER_S = 4.2;
+constexpr double MAX_DECEL_MPH_PER_S = 6.5;
+
+double g_target_wheel_mph = 0.0;
+double g_actual_wheel_mph = 0.0;
+double g_wheel_phase = 0.25; // Start away from sensor (sensor at phase 0.0)
+bool g_wheel_magnet_active = false;
+
+void advance_simulated_wheel(double dt_ms) {
+    if (dt_ms <= 0.0) return;
+
+    double diff = g_target_wheel_mph - g_actual_wheel_mph;
+    if (std::fabs(diff) > 1e-6) {
+        double dt_s = dt_ms / 1000.0;
+        double base_rate = (diff > 0.0) ? MAX_ACCEL_MPH_PER_S : MAX_DECEL_MPH_PER_S;
+        // Smooth ease-out within 1.8 mph of target
+        double ease = std::min(1.0, std::fabs(diff) / 1.8);
+        double rate = std::max(0.6, base_rate * ease);
+        double max_step = rate * dt_s;
+        if (std::fabs(diff) <= max_step) {
+            g_actual_wheel_mph = g_target_wheel_mph;
+        } else {
+            g_actual_wheel_mph += (diff > 0.0 ? max_step : -max_step);
+        }
+    }
+
+    if (g_actual_wheel_mph <= 0.0) {
+        g_actual_wheel_mph = 0.0;
+        g_wheel_magnet_active = false;
+        return;
+    }
+
+    double speed_mps = g_actual_wheel_mph * MPH_TO_MPS;
+    double revs_per_ms = (speed_mps / WHEEL_CIRCUMFERENCE_M) / 1000.0;
+    double d_phase = revs_per_ms * dt_ms;
+    double next_phase = g_wheel_phase + d_phase;
+    bool crossed_sensor = (next_phase >= 1.0);
+    g_wheel_phase = std::fmod(next_phase, 1.0);
+    g_wheel_magnet_active = crossed_sensor || (g_wheel_phase < MAGNET_TRIGGER_ARC_FRAC);
+}
 
 } // namespace
 
@@ -80,6 +133,9 @@ int sim_digitalRead(int pin) {
     if (pin < 0 || pin >= MAX_PINS) return LOW;
     if (g_pin_mode[pin] == OUTPUT) {
         return g_pin_digital_out[pin];
+    }
+    if (pin == HALL_SENSOR_PIN && g_wheel_magnet_active) {
+        return LOW;
     }
     if (!g_pin_external_set[pin] && g_pin_mode[pin] == INPUT_PULLUP) {
         return HIGH;
@@ -157,6 +213,9 @@ EMSCRIPTEN_KEEPALIVE void sim_init() {
     g_sim_time_ms = 0.0;
     g_show_count = 0;
     g_serial_line_buf.clear();
+    g_actual_wheel_mph = 0.0;
+    g_wheel_phase = 0.25;
+    g_wheel_magnet_active = false;
 
     setup();
     // Avoid microsecond spin-wait inside CFastLED::show() in simulated time
@@ -174,18 +233,32 @@ EMSCRIPTEN_KEEPALIVE void sim_step(double delta_ms) {
     if (delta_ms > 250.0) {
         delta_ms = 250.0;
     }
-    // Step in 1ms increments so EVERY_N_MILLIS(20) and 50ms button debouncing
-    // behave identically to hardware polling at >=1kHz.
+    // Step in 1ms increments so EVERY_N_MILLIS(20), Hall sensor pulses, and 50ms
+    // button debouncing behave identically to hardware polling at >=1kHz.
     double target = g_sim_time_ms + delta_ms;
     while (g_sim_time_ms + 1.0 <= target) {
         g_sim_time_ms += 1.0;
+        advance_simulated_wheel(1.0);
         loop();
     }
     double rem = target - g_sim_time_ms;
     if (rem > 1e-6) {
         g_sim_time_ms = target;
+        advance_simulated_wheel(rem);
         loop();
     }
+}
+
+EMSCRIPTEN_KEEPALIVE void sim_set_wheel_speed_mph(double mph) {
+    g_target_wheel_mph = (mph > 0.0) ? mph : 0.0;
+}
+
+EMSCRIPTEN_KEEPALIVE double sim_get_actual_wheel_speed_mph() {
+    return g_actual_wheel_mph;
+}
+
+EMSCRIPTEN_KEEPALIVE double sim_get_wheel_phase() {
+    return g_wheel_phase;
 }
 
 EMSCRIPTEN_KEEPALIVE void sim_set_input_pin(int pin, int level) {
@@ -224,6 +297,10 @@ EMSCRIPTEN_KEEPALIVE int sim_get_brightness() {
 
 EMSCRIPTEN_KEEPALIVE uint32_t sim_get_show_count() {
     return g_show_count;
+}
+
+EMSCRIPTEN_KEEPALIVE double sim_get_estimated_velocity_mph() {
+    return static_cast<double>(wheelSpeed.getVelocityMph());
 }
 
 } // extern "C"
