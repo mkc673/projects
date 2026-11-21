@@ -4,12 +4,14 @@
 #include <emscripten.h>
 #include <string>
 
+#include "effects.h"
 #include "wheel_speed.h"
 
 // Declarations from src/main.cpp
 extern void setup();
 extern void loop();
 extern WheelSpeedSensor wheelSpeed;
+extern EffectMode currentEffect;
 
 SimSerialPort SimSerial;
 
@@ -51,6 +53,7 @@ double g_target_wheel_mph = 0.0;
 double g_actual_wheel_mph = 0.0;
 double g_wheel_phase = 0.25; // Start away from sensor (sensor at phase 0.0)
 bool g_wheel_magnet_active = false;
+bool g_hall_triggered_since_render = false;
 
 void advance_simulated_wheel(double dt_ms) {
     if (dt_ms <= 0.0) return;
@@ -83,6 +86,9 @@ void advance_simulated_wheel(double dt_ms) {
     bool crossed_sensor = (next_phase >= 1.0);
     g_wheel_phase = std::fmod(next_phase, 1.0);
     g_wheel_magnet_active = crossed_sensor || (g_wheel_phase < MAGNET_TRIGGER_ARC_FRAC);
+    if (g_wheel_magnet_active) {
+        g_hall_triggered_since_render = true;
+    }
 }
 
 } // namespace
@@ -216,6 +222,7 @@ EMSCRIPTEN_KEEPALIVE void sim_init() {
     g_actual_wheel_mph = 0.0;
     g_wheel_phase = 0.25;
     g_wheel_magnet_active = false;
+    g_hall_triggered_since_render = false;
 
     setup();
     // Avoid microsecond spin-wait inside CFastLED::show() in simulated time
@@ -301,6 +308,21 @@ EMSCRIPTEN_KEEPALIVE uint32_t sim_get_show_count() {
 
 EMSCRIPTEN_KEEPALIVE double sim_get_estimated_velocity_mph() {
     return static_cast<double>(wheelSpeed.getVelocityMph());
+}
+
+EMSCRIPTEN_KEEPALIVE void sim_set_effect_mode(int mode) {
+    if (mode < 0 || mode > 5) mode = 0;
+    currentEffect = static_cast<EffectMode>(mode);
+}
+
+EMSCRIPTEN_KEEPALIVE int sim_get_effect_mode() {
+    return static_cast<int>(currentEffect);
+}
+
+EMSCRIPTEN_KEEPALIVE int sim_consume_hall_triggered() {
+    bool triggered = g_hall_triggered_since_render || (sim_digitalRead(HALL_SENSOR_PIN) == LOW);
+    g_hall_triggered_since_render = false;
+    return triggered ? 1 : 0;
 }
 
 } // extern "C"

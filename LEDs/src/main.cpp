@@ -2,16 +2,20 @@
 
 #include <FastLED.h>
 
+#include "effects.h"
 #include "light_state.h"
 #include "turn_signal.h"
 #include "turn_signal_button.h"
+#include "wheel_speed.h"
 
 using namespace fl;
 
 // // Configuration
 #define LED_PIN     6
-#define RIGHT_LEDS 4
+#define RIGHT_LEDS  4
+#define FRONT_LEDS  8
 #define NUM_LEDS    144
+#define NUM_FRONT_LEDS 144
 #define LED_TYPE    WS2815
 #define COLOR_ORDER GRB
 #define CHIPSET     WS2815
@@ -32,11 +36,15 @@ unsigned long turnSignalDuration = 3000;
 // LED array
 CRGB ledsLeft[NUM_LEDS];
 CRGB ledsRight[NUM_LEDS];
+CRGB ledsFront[NUM_FRONT_LEDS];
 
 TurnSignal leftTurnSignal(NUM_LEDS, ledsLeft, REAR_SIGNAL_TRANSISTOR_LEFT);
 TurnSignal rightTurnSignal(NUM_LEDS, ledsRight, REAR_SIGNAL_TRANSISTOR_RIGHT);
 TurnSignalButton leftTurnSignalButton(LEFT_BUTTON);
 TurnSignalButton rightTurnSignalButton(RIGHT_BUTTON);
+WheelSpeedSensor wheelSpeed(HALL_SENSOR);
+VelocityEffects velocityEffects;
+EffectMode currentEffect = EffectMode::RAINBOW_COMET;
 
 enum class SignalState {
   NONE,
@@ -56,7 +64,7 @@ void stopTurnSignal() {
 
 // Callback invoked on debounced press
 void onLeftButtonPressed() {
-  Serial.println("Callback: button press registered");
+  Serial.println(F("Callback: button press registered"));
   rightTurnSignal.stop();
   switch (currentSignal) {
     case SignalState::NONE:
@@ -71,7 +79,7 @@ void onLeftButtonPressed() {
 }
 
 void onRightButtonPressed() {
-  Serial.println("Callback: right button press registered");
+  Serial.println(F("Callback: right button press registered"));
   leftTurnSignal.stop();
   switch (currentSignal) {
     case SignalState::NONE:
@@ -122,18 +130,20 @@ void renderComet(int position) {
 }
 
 void setup() {
-  Serial.println("Starting up!");
+    Serial.begin(9600);
+    Serial.println(F("Starting up!"));
     // Initialize FastLED
     FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(ledsLeft, NUM_LEDS);
     FastLED.addLeds<LED_TYPE, RIGHT_LEDS, COLOR_ORDER>(ledsRight, NUM_LEDS);
+    FastLED.addLeds<LED_TYPE, FRONT_LEDS, COLOR_ORDER>(ledsFront, NUM_FRONT_LEDS);
     FastLED.setBrightness(DEFAULT_BRIGHTNESS);
+    fill_solid(ledsFront, NUM_FRONT_LEDS, CRGB::Black);
     // FastLED.setGammaFunction(::GammaCorrect);
 
-    Serial.begin(9600);
     leftTurnSignalButton.setCallback(onLeftButtonPressed);
     rightTurnSignalButton.setCallback(onRightButtonPressed);
 
-    pinMode(HALL_SENSOR, INPUT_PULLUP);
+    wheelSpeed.begin();
 
     // fill_rainbow(leds, NUM_LEDS, 0, 7);
     // int rainbowLength = NUM_LEDS / 3;
@@ -171,31 +181,35 @@ void render(LightState& state) {
 }
 
 void loop() {
+  wheelSpeed.update();
+
   EVERY_N_MILLIS(20) {
-  rightTurnSignalButton.update();
-  leftTurnSignalButton.update();
+    rightTurnSignalButton.update();
+    leftTurnSignalButton.update();
 
-  int sensorState = digitalRead(HALL_SENSOR);
+    float currentMph = wheelSpeed.getVelocityMph();
+    velocityEffects.stepPhysics(currentMph, NUM_LEDS);
 
-  if (sensorState == LOW) {
-    Serial.println("Magnet detected!");
-  }
-
-  // If a turn signal is active, render it and skip other animations
-  if (currentSignal != SignalState::NONE) {
-    if (millis() < turnSignalEnd) {
-      if (currentSignal == SignalState::LEFT) {
-        leftTurnSignal.render();
-      } else if (currentSignal == SignalState::RIGHT) {
-        rightTurnSignal.render();
+    // If a turn signal is active, render it and skip other animations
+    if (currentSignal != SignalState::NONE) {
+      if (millis() < turnSignalEnd) {
+        if (currentSignal == SignalState::LEFT) {
+          leftTurnSignal.render();
+        } else if (currentSignal == SignalState::RIGHT) {
+          rightTurnSignal.render();
+        }
+      } else {
+        stopTurnSignal();
       }
+    } else if (currentEffect == EffectMode::RAINBOW_COMET) {
+      renderComet((millis() / 10) % NUM_LEDS);
     } else {
-      stopTurnSignal();
+      velocityEffects.renderEffect(currentEffect, ledsLeft, ledsRight, NUM_LEDS, currentMph);
     }
-  } else {
-    renderComet((millis() / 10) % NUM_LEDS);
-  }
 
-  FastLED.show();
+    // Front arch strip stays off for now
+    fill_solid(ledsFront, NUM_FRONT_LEDS, CRGB::Black);
+
+    FastLED.show();
   }
 }

@@ -5,6 +5,7 @@
     RIGHT_STRIP: 4,
     LEFT_STRIP: 6,
     HALL_SENSOR: 7,
+    FRONT_STRIP: 8,
     REAR_LEFT_PWM: 9,
     REAR_RIGHT_PWM: 10,
   };
@@ -18,7 +19,9 @@
 
   const statusDot = document.getElementById('statusDot');
   const statusText = document.getElementById('statusText');
-  const layoutSelect = document.getElementById('layoutSelect');
+  const effectSelect = document.getElementById('effectSelect');
+  const layoutBtns = Array.from(document.querySelectorAll('.layout-btn'));
+  let currentLayout = 'side';
   const speedSelect = document.getElementById('speedSelect');
   const playPauseBtn = document.getElementById('playPauseBtn');
   const stepBtn = document.getElementById('stepBtn');
@@ -56,10 +59,27 @@
   let running = true;
   let lastWallTime = null;
   let groundDistanceMeters = 0;
+  let crankAngleRad = 0.4; // Initial realistic pedal stance
+  let hallTriggeredThisFrame = false;
+
+  // 2.55:1 gearing ratio on 26" rear wheel (C = 2.105m => ~5.37m per crank revolution, ~75 RPM at 15 mph)
+  const GEAR_RATIO = 2.55;
+  const METERS_PER_CRANK_REV = 2 * Math.PI * 0.335 * GEAR_RATIO;
 
   // Interactive centered camera zoom state (mouse wheel, trackpad pinch, touch pinch)
   const MIN_ZOOM = 0.18;
-  const camera = { zoom: 1.0 };
+  const zoomByGroup = {
+    bike: 1.0,   // Shared zoom across Side ('side') and Top ('bike') views
+    strips: 1.0, // Separate zoom for Parallel Strips ('strips') view
+  };
+  const camera = {
+    get zoom() {
+      return zoomByGroup[currentLayout === 'strips' ? 'strips' : 'bike'];
+    },
+    set zoom(val) {
+      zoomByGroup[currentLayout === 'strips' ? 'strips' : 'bike'] = val;
+    },
+  };
   let pinchPrevDist = null;
   let isTouchPinching = false;
   let lastWheelZoomWall = 0;
@@ -218,7 +238,21 @@
     updateWheelSliderVisuals();
   }
 
+  function syncEffectMode() {
+    const mode = parseInt(effectSelect.value, 10) || 0;
+    if (api && api.setEffectMode) {
+      api.setEffectMode(mode);
+    }
+  }
+
   wheelSpeedSlider.addEventListener('input', syncWheelSpeed);
+  effectSelect.addEventListener('change', () => {
+    syncEffectMode();
+    if (api && !running) {
+      advanceSimulation(20.0);
+      renderFrame();
+    }
+  });
 
   // Keyboard controls
   window.addEventListener('keydown', (e) => {
@@ -278,14 +312,18 @@
         getBrightness: mod.cwrap('sim_get_brightness', 'number', []),
         getShowCount: mod.cwrap('sim_get_show_count', 'number', []),
         getEstimatedVelocityMph: mod.cwrap('sim_get_estimated_velocity_mph', 'number', []),
+        setEffectMode: mod.cwrap('sim_set_effect_mode', null, ['number']),
+        getEffectMode: mod.cwrap('sim_get_effect_mode', 'number', []),
         setWheelSpeedMph: mod.cwrap('sim_set_wheel_speed_mph', null, ['number']),
         getActualWheelSpeedMph: mod.cwrap('sim_get_actual_wheel_speed_mph', 'number', []),
         getWheelPhase: mod.cwrap('sim_get_wheel_phase', 'number', []),
+        consumeHallTriggered: mod.cwrap('sim_consume_hall_triggered', 'number', []),
         millis: mod.cwrap('millis', 'number', []),
       };
 
       api.init();
       syncInputPins();
+      syncEffectMode();
       syncWheelSpeed();
       lastShowCount = api.getShowCount();
       lastRateCheckWall = performance.now();
@@ -298,9 +336,20 @@
     syncInputPins();
     api.step(simDeltaMs);
     syncInputPins();
+    hallTriggeredThisFrame = api.consumeHallTriggered
+      ? api.consumeHallTriggered() === 1
+      : api.getPinDigital(PINS.HALL_SENSOR) === 0;
     const v1 = api.getActualWheelSpeedMph ? api.getActualWheelSpeedMph() : 0;
     const avgMps = ((v0 + v1) * 0.5) * 0.44704;
-    groundDistanceMeters += avgMps * (simDeltaMs / 1000);
+    const deltaMeters = avgMps * (simDeltaMs / 1000);
+    groundDistanceMeters += deltaMeters;
+
+    // Spin pedals when accelerating or maintaining speed; coast (freewheel) when decelerating or stopped
+    const targetMph = parseFloat(wheelSpeedSlider.value) || 0;
+    const isPedaling = targetMph > 0.01 && targetMph >= v1 - 0.05;
+    if (isPedaling && deltaMeters > 0) {
+      crankAngleRad = (crankAngleRad + (deltaMeters / METERS_PER_CRANK_REV) * Math.PI * 2) % (Math.PI * 2);
+    }
   }
 
   function resetSimulation() {
@@ -311,6 +360,8 @@
     serialLog.innerHTML = '';
     lastWallTime = null;
     groundDistanceMeters = 0;
+    crankAngleRad = 0.4;
+    hallTriggeredThisFrame = false;
     bootModule().then(() => {
       renderFrame();
     });
@@ -402,7 +453,7 @@
     const rect = canvas.getBoundingClientRect();
     const w = Math.max(1, rect.width);
     const h = Math.max(1, rect.height);
-    const { maxFitZoom } = getBikeViewportMetrics(w, h, layoutSelect.value);
+    const { maxFitZoom } = getBikeViewportMetrics(w, h, currentLayout);
 
     const rawNext = camera.zoom * factor;
     if (rawNext <= maxFitZoom) {
@@ -426,9 +477,17 @@
     };
   }
 
-  layoutSelect.addEventListener('change', () => {
-    resetCamera();
-  });
+  for (const btn of layoutBtns) {
+    btn.addEventListener('click', () => {
+      const next = btn.getAttribute('data-layout') || 'side';
+      if (next === currentLayout) return;
+      currentLayout = next;
+      for (const b of layoutBtns) {
+        b.classList.toggle('active', b === btn);
+      }
+      if (api) renderFrame();
+    });
+  }
 
   // Mouse wheel + desktop trackpad pinch-to-zoom (always centered on bike)
   canvas.addEventListener(
@@ -503,35 +562,89 @@
     };
   }
 
-  function drawGlowingPixel(x, y, radius, r, g, b) {
-    const maxCh = Math.max(r, g, b);
-    if (maxCh <= 2) {
-      ctx.fillStyle = '#141923';
-      ctx.beginPath();
-      ctx.arc(x, y, radius * 0.82, 0, Math.PI * 2);
-      ctx.fill();
-      return;
+  // Perceptual LED gamma LUT (compensates for monitor sRGB crushing mid-tone FastLED values
+  // while keeping 0 strictly 0 so saturated colors never wash out to white).
+  const LED_DISPLAY_LUT = new Uint8Array(256);
+  for (let v = 1; v < 256; v++) {
+    LED_DISPLAY_LUT[v] = Math.min(255, Math.round(255 * Math.pow(v / 255, 0.52)));
+  }
+
+  function drawStripPoints(points, radius, haloScale = 1.0) {
+    if (!points.length) return;
+
+    // Estimate pixel-to-pixel spacing so bloom intensity stays lush & consistent across all views
+    let spacingPx = radius * 2.2;
+    if (points.length > 1) {
+      let totalLen = 0;
+      const step = Math.max(1, Math.floor(points.length / 8));
+      let prev = points[0];
+      for (let i = step; i < points.length; i += step) {
+        totalLen += Math.hypot(points[i].x - prev.x, points[i].y - prev.y);
+        prev = points[i];
+      }
+      if (prev !== points[points.length - 1]) {
+        const last = points[points.length - 1];
+        totalLen += Math.hypot(last.x - prev.x, last.y - prev.y);
+      }
+      spacingPx = Math.max(0.65, totalLen / (points.length - 1));
     }
 
-    // Soft additive bloom halo
-    const alpha = (maxCh / 255) * 0.42;
-    const glowR = radius * 3.2;
-    const grad = ctx.createRadialGradient(x, y, radius * 0.2, x, y, glowR);
-    grad.addColorStop(0, `rgba(${r}, ${g}, ${b}, ${alpha})`);
-    grad.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.arc(x, y, glowR, 0, Math.PI * 2);
-    ctx.fill();
+    // Pass 1: unlit dark LED packages (drawn first so they never cover lit neighbors)
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#141923';
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      if (p.maxCh <= 2) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, radius * 0.78, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
 
-    // Bright LED die core
-    const coreR = Math.min(255, r + 45);
-    const coreG = Math.min(255, g + 45);
-    const coreB = Math.min(255, b + 45);
-    ctx.fillStyle = `rgb(${coreR}, ${coreG}, ${coreB})`;
-    ctx.beginPath();
-    ctx.arc(x, y, radius, 0, Math.PI * 2);
-    ctx.fill();
+    // Pass 2: rich, spacing-normalized colored bloom aura behind the emitter cores
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const glowR = Math.max(7.5, radius * 4.0);
+    const overlap = Math.max(1.0, (glowR * 1.35) / spacingPx);
+    const baseBloom = (0.68 / overlap) * haloScale;
+
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      if (p.maxCh <= 2) continue;
+      const dr = LED_DISPLAY_LUT[p.r];
+      const dg = LED_DISPLAY_LUT[p.g];
+      const db = LED_DISPLAY_LUT[p.b];
+      const dMax = Math.max(dr, dg, db);
+      const alpha = Math.min(0.45, (dMax / 255) * baseBloom);
+      if (alpha <= 0.003) continue;
+      const grad = ctx.createRadialGradient(p.x, p.y, radius * 0.15, p.x, p.y, glowR);
+      grad.addColorStop(0, `rgba(${dr}, ${dg}, ${db}, ${alpha})`);
+      grad.addColorStop(0.45, `rgba(${dr}, ${dg}, ${db}, ${alpha * 0.42})`);
+      grad.addColorStop(1, `rgba(${dr}, ${dg}, ${db}, 0)`);
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, glowR, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // Pass 3: bright gamma-boosted LED emitter cores on top (zero channels stay 0 => vibrant color)
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-over';
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      if (p.maxCh <= 2) continue;
+      const dr = LED_DISPLAY_LUT[p.r];
+      const dg = LED_DISPLAY_LUT[p.g];
+      const db = LED_DISPLAY_LUT[p.b];
+      ctx.fillStyle = `rgb(${dr}, ${dg}, ${db})`;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
   }
 
   function drawChevronTurnStrip(
@@ -593,24 +706,22 @@
     const r = Math.round(255 * intensity);
     const g = Math.round(128 * intensity);
     const b = Math.round(6 * intensity);
+    const maxCh = Math.max(r, g, b);
+    const chevronPts = [];
 
-    ctx.save();
-    if (intensity > 0.01) {
-      ctx.globalCompositeOperation = 'lighter';
-    }
     for (let i = 0; i <= ledsPerArm; i++) {
       const t = i / ledsPerArm;
       const ux = topPt.x + (midPt.x - topPt.x) * t;
       const uy = topPt.y + (midPt.y - topPt.y) * t;
-      drawGlowingPixel(ux, uy, dotRadius, r, g, b);
+      chevronPts.push({ x: ux, y: uy, r, g, b, maxCh });
 
       if (i > 0) {
         const lx = midPt.x + (botPt.x - midPt.x) * t;
         const ly = midPt.y + (botPt.y - midPt.y) * t;
-        drawGlowingPixel(lx, ly, dotRadius, r, g, b);
+        chevronPts.push({ x: lx, y: ly, r, g, b, maxCh });
       }
     }
-    ctx.restore();
+    drawStripPoints(chevronPts, dotRadius, 1.1);
 
     if (label) {
       ctx.fillStyle = intensity > 0.05 ? '#fbbf24' : '#7b8ca6';
@@ -713,7 +824,7 @@
     ctx.restore();
   }
 
-  function drawBikeLayout(w, h, leftStrip, rightStrip, pwmLeft, pwmRight, hallLow, bounds) {
+  function drawBikeLayout(w, h, leftStrip, rightStrip, frontStrip, pwmLeft, pwmRight, hallLow, bounds) {
     const cx = w / 2;
     const yTop = 34;
     const yBottom = h - 38;
@@ -729,7 +840,7 @@
     const boxH = boxBot - boxTop;
 
     const cockpitY = yTop + bikeLen * 0.585;
-    const saddleY = yTop + bikeLen * 0.74;
+    const saddleY = yTop + bikeLen * 0.732;
 
     const rwTop = yTop + bikeLen * 0.775;
     const rwBot = yTop + bikeLen * 0.975;
@@ -763,7 +874,32 @@
     ctx.lineTo(cx + 14, cockpitY);
     ctx.stroke();
 
-    // 2. 20" Front wheel + fender
+    // 2. 20" Front wheel + fender + Front Headlight Cone (ahead of the front arch LEDs)
+    const archStartLeft = { x: cx - (boxFrontHalfW + 5), y: boxTop + 4 };
+    const archEndRight = { x: cx + (boxFrontHalfW + 5), y: boxTop + 4 };
+    const archApexY = boxTop - 14;
+    const hlCy = archApexY - 10;
+    const hlLensY = hlCy - 5;
+    const beamLenTop = Math.max(180, pxPerMeter * 1.45);
+    const beamSpreadTop = beamLenTop * 0.42;
+
+    // Headlight beam cone projecting forward (-y) onto the road ahead
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const topConeGrad = ctx.createLinearGradient(cx, hlLensY, cx, hlLensY - beamLenTop);
+    topConeGrad.addColorStop(0, 'rgba(245, 250, 255, 0.34)');
+    topConeGrad.addColorStop(0.35, 'rgba(225, 240, 255, 0.14)');
+    topConeGrad.addColorStop(1, 'rgba(215, 235, 255, 0)');
+    ctx.fillStyle = topConeGrad;
+    ctx.beginPath();
+    ctx.moveTo(cx - 5, hlLensY);
+    ctx.lineTo(cx + 5, hlLensY);
+    ctx.lineTo(cx + beamSpreadTop, hlLensY - beamLenTop);
+    ctx.lineTo(cx - beamSpreadTop, hlLensY - beamLenTop);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
     ctx.fillStyle = '#121824';
     ctx.strokeStyle = '#2c3b57';
     ctx.lineWidth = 2;
@@ -772,7 +908,7 @@
     ctx.fill();
     ctx.stroke();
 
-    // Front fork crown
+    // Front fork crown + white front frame arch connecting box front corners around headtube
     ctx.strokeStyle = '#334463';
     ctx.lineWidth = 3;
     ctx.beginPath();
@@ -781,6 +917,45 @@
     ctx.moveTo(cx + 11, fwCy - 6);
     ctx.lineTo(cx + 11, boxTop + 4);
     ctx.stroke();
+
+    // White tubular front arch structure + dark PCB strip channel underneath LEDs
+    ctx.strokeStyle = '#7c8ea6';
+    ctx.lineWidth = 6;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(archStartLeft.x, archStartLeft.y);
+    ctx.bezierCurveTo(
+      cx - boxFrontHalfW * 0.92,
+      archApexY,
+      cx + boxFrontHalfW * 0.92,
+      archApexY,
+      archEndRight.x,
+      archEndRight.y
+    );
+    ctx.stroke();
+
+    ctx.strokeStyle = '#0b0f18';
+    ctx.lineWidth = 3.5;
+    ctx.stroke();
+
+    // Headlight housing & bright lens mounted ahead of the front arch crown
+    ctx.strokeStyle = '#475e85';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(cx, archApexY + 2);
+    ctx.lineTo(cx, hlCy + 3);
+    ctx.stroke();
+
+    ctx.fillStyle = '#141c2c';
+    ctx.strokeStyle = '#526b94';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.roundRect(cx - 6.5, hlCy - 5, 13, 9.5, 3);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = '#f8fafc';
+    ctx.fillRect(cx - 4.5, hlLensY - 1, 9, 2);
 
     // 3. Load 75 Front Cargo Box (EPP tub + outer tubular frame)
     ctx.beginPath();
@@ -869,18 +1044,53 @@
     ctx.arc(cx + barHalfW - 21, cockpitY + 4, 3.5, 0, Math.PI * 2);
     ctx.fill();
 
-    // Rider saddle
-    ctx.fillStyle = '#1a2334';
-    ctx.strokeStyle = '#334463';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(cx, saddleY - 16);
-    ctx.quadraticCurveTo(cx + 16, saddleY + 8, cx + 12, saddleY + 18);
-    ctx.quadraticCurveTo(cx, saddleY + 15, cx - 12, saddleY + 18);
-    ctx.quadraticCurveTo(cx - 16, saddleY + 8, cx, saddleY - 16);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
+    // Bottom bracket, crank arms & pedals (top-down projection) ahead of saddle
+    const bbTopY = yTop + bikeLen * 0.672;
+    const crankLenTop = pxPerMeter * 0.172;
+    const lerpRgb = (c0, c1, t) => {
+      const r = Math.round(c0[0] + (c1[0] - c0[0]) * t);
+      const g = Math.round(c0[1] + (c1[1] - c0[1]) * t);
+      const b = Math.round(c0[2] + (c1[2] - c0[2]) * t);
+      return `rgb(${r}, ${g}, ${b})`;
+    };
+    const drawTopPedal = (sideSign, angle) => {
+      // cos(angle): +1 forward (-y), -1 rearward (+y); -sin(angle): +1 top of stroke, -1 bottom of stroke
+      const py = bbTopY - Math.cos(angle) * crankLenTop;
+      const elev = -Math.sin(angle); // -1 (low) .. +1 (high)
+      const elevT = (elev + 1) * 0.5; // Smooth 0.0 (bottom) .. 1.0 (top)
+      const armX = cx + sideSign * 12;
+      const pedalInX = cx + sideSign * 14;
+      const pedalOutX = cx + sideSign * 26;
+
+      ctx.strokeStyle = lerpRgb([38, 52, 77], [75, 98, 138], elevT);
+      ctx.lineWidth = 2.4 + 0.8 * elevT;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(cx + sideSign * 6, bbTopY);
+      ctx.lineTo(armX, py);
+      ctx.stroke();
+
+      // Pedal spindle + platform body
+      ctx.strokeStyle = lerpRgb([43, 58, 85], [75, 98, 138], elevT);
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.moveTo(armX, py);
+      ctx.lineTo(pedalInX, py);
+      ctx.stroke();
+
+      const pw = Math.abs(pedalOutX - pedalInX);
+      const ph = 5.8 + 1.7 * elevT;
+      const pxLeft = Math.min(pedalInX, pedalOutX);
+      ctx.fillStyle = lerpRgb([20, 28, 43], [34, 48, 73], elevT);
+      ctx.strokeStyle = lerpRgb([51, 70, 102], [100, 127, 168], elevT);
+      ctx.lineWidth = 1.3;
+      ctx.beginPath();
+      ctx.roundRect(pxLeft, py - ph * 0.5, pw, ph, 2);
+      ctx.fill();
+      ctx.stroke();
+    };
+    drawTopPedal(-1, crankAngleRad + Math.PI);
+    drawTopPedal(+1, crankAngleRad);
 
     // 5. 26" Rear wheel + Rear Cargo Rack + Spoke Magnet Hall Sensor (D7)
     ctx.fillStyle = '#121824';
@@ -888,6 +1098,19 @@
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.roundRect(cx - 9, rwTop, 18, rwBot - rwTop, 9);
+    ctx.fill();
+    ctx.stroke();
+
+    // Rider saddle (drawn above frame spine & front tip of rear fender)
+    ctx.fillStyle = '#1a2334';
+    ctx.strokeStyle = '#334463';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, saddleY - 22);
+    ctx.bezierCurveTo(cx + 6, saddleY - 12, cx + 22, saddleY + 5, cx + 17, saddleY + 21);
+    ctx.quadraticCurveTo(cx, saddleY + 17, cx - 17, saddleY + 21);
+    ctx.bezierCurveTo(cx - 22, saddleY + 5, cx - 6, saddleY - 12, cx, saddleY - 22);
+    ctx.closePath();
     ctx.fill();
     ctx.stroke();
 
@@ -928,37 +1151,62 @@
     const stripSpanH = boxH - 10;
     const ledRadius = Math.max(1.6, Math.min(3.0, (stripSpanH / count) * 0.65));
 
-    ctx.save();
-    ctx.globalCompositeOperation = 'lighter';
+    const leftPts = [];
+    const rightPts = [];
     for (let i = 0; i < count; i++) {
       // t = 0 at front nose of cargo box, t = 1 at rear bulkhead of cargo box
       const t = i / (count - 1);
       const idx = count - 1 - i;
       const y = boxTop + 5 + t * stripSpanH;
       const halfW = boxHalfWidthAt(t) + stripMargin;
-
-      const lx = cx - halfW;
-      const rx = cx + halfW;
-
       const bIdx = idx * 3;
-      drawGlowingPixel(
-        lx,
-        y,
-        ledRadius,
-        leftStrip.bytes[bIdx],
-        leftStrip.bytes[bIdx + 1],
-        leftStrip.bytes[bIdx + 2]
-      );
-      drawGlowingPixel(
-        rx,
-        y,
-        ledRadius,
-        rightStrip.bytes[bIdx],
-        rightStrip.bytes[bIdx + 1],
-        rightStrip.bytes[bIdx + 2]
-      );
+
+      const lr = leftStrip.bytes[bIdx];
+      const lg = leftStrip.bytes[bIdx + 1];
+      const lb = leftStrip.bytes[bIdx + 2];
+      leftPts.push({ x: cx - halfW, y, r: lr, g: lg, b: lb, maxCh: Math.max(lr, lg, lb) });
+
+      const rr = rightStrip.bytes[bIdx];
+      const rg = rightStrip.bytes[bIdx + 1];
+      const rb = rightStrip.bytes[bIdx + 2];
+      rightPts.push({ x: cx + halfW, y, r: rr, g: rg, b: rb, maxCh: Math.max(rr, rg, rb) });
     }
-    ctx.restore();
+    drawStripPoints(leftPts, ledRadius, 1.0);
+    drawStripPoints(rightPts, ledRadius, 1.0);
+
+    // Front Arch 144-LED Strip (ledsFront[144] on Pin D8) wrapping around the front arch
+    const frontCount = frontStrip.len;
+    const cp1x = cx - boxFrontHalfW * 0.92;
+    const cp1y = archApexY;
+    const cp2x = cx + boxFrontHalfW * 0.92;
+    const cp2y = archApexY;
+    const frontPts = [];
+    for (let i = 0; i < frontCount; i++) {
+      const u = i / (frontCount - 1);
+      const inv = 1 - u;
+      const ax =
+        inv * inv * inv * archStartLeft.x +
+        3 * inv * inv * u * cp1x +
+        3 * inv * u * u * cp2x +
+        u * u * u * archEndRight.x;
+      const ay =
+        inv * inv * inv * archStartLeft.y +
+        3 * inv * inv * u * cp1y +
+        3 * inv * u * u * cp2y +
+        u * u * u * archEndRight.y;
+      const fIdx = i * 3;
+      const fr = frontStrip.bytes[fIdx];
+      const fg = frontStrip.bytes[fIdx + 1];
+      const fb = frontStrip.bytes[fIdx + 2];
+      frontPts.push({ x: ax, y: ay, r: fr, g: fg, b: fb, maxCh: Math.max(fr, fg, fb) });
+    }
+    drawStripPoints(frontPts, ledRadius, 1.0);
+
+    // Move Top-Down ledsFront label slightly below arch crown so it doesn't collide with headlight
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px ui-monospace, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('ledsFront[144] · D8', cx, boxTop + 20);
 
     // Cargo box strip annotations & index endpoints
     const frontIdxLabel = String(count - 1);
@@ -1191,7 +1439,7 @@
     ctx.restore();
   }
 
-  function drawBikeSideLayout(w, h, rightStrip, pwmLeft, pwmRight, hallLow, bounds) {
+  function drawBikeSideLayout(w, h, rightStrip, frontStrip, pwmLeft, pwmRight, hallLow, bounds) {
     // Riese & Müller Load 75 facing RIGHT (+x), 2.68 m total length
     const bikeRealLenM = 2.68;
     const padLeft = Math.max(88, w * 0.11);
@@ -1259,10 +1507,10 @@
     const steererBotY = my(0.26);
     const stemTopX = mx(1.20);
     const stemTopY = my(1.03);
-    const headTubeTopX = mx(2.33);
-    const headTubeTopY = my(0.54);
-    const headTubeBotX = mx(2.36);
-    const headTubeBotY = my(0.39);
+    const headTubeTopX = mx(2.225);
+    const headTubeTopY = my(0.595);
+    const headTubeBotX = mx(2.265);
+    const headTubeBotY = my(0.44);
 
     // Right-side steering linkage rod under cargo box (signature Load 75 detail)
     ctx.strokeStyle = '#334666';
@@ -1317,12 +1565,94 @@
     ctx.textAlign = 'right';
     ctx.fillText(hallLow ? 'MAGNET! (D7)' : 'D7 HALL', hallX - 8, hallY - 4);
 
-    // Bosch motor housing at bottom bracket
+    // Drivetrain: far-side (left) crank & pedal, belt/chain loop, Bosch motor, chainring, near-side (right) crank & pedal
+    const crankLenPx = 0.172 * pxPerMeter;
+    const chainringR = Math.max(11, 0.102 * pxPerMeter);
+    const rearCogR = Math.max(5, 0.042 * pxPerMeter);
+
+    // 3a. Far-side (left) crank arm + horizontal platform pedal (behind motor housing)
+    const leftCrankAng = crankAngleRad + Math.PI;
+    const lPedalX = bbX + Math.cos(leftCrankAng) * crankLenPx;
+    const lPedalY = bbY + Math.sin(leftCrankAng) * crankLenPx;
+
+    ctx.strokeStyle = '#223049';
+    ctx.lineWidth = 3.8;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(bbX, bbY);
+    ctx.lineTo(lPedalX, lPedalY);
+    ctx.stroke();
+
+    ctx.fillStyle = '#141d2d';
+    ctx.strokeStyle = '#334768';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.roundRect(lPedalX - 6.5, lPedalY - 2.2, 13, 4.4, 1.5);
+    ctx.fill();
+    ctx.stroke();
+
+    // 3b. Belt / chain drive loop connecting front sprocket and rear cog
+    ctx.strokeStyle = '#24334d';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(bbX, bbY - chainringR);
+    ctx.lineTo(rearHubX, rearHubY - rearCogR);
+    ctx.moveTo(bbX, bbY + chainringR);
+    ctx.lineTo(rearHubX, rearHubY + rearCogR);
+    ctx.arc(rearHubX, rearHubY, rearCogR, Math.PI * 0.5, -Math.PI * 0.5, false);
+    ctx.stroke();
+
+    // 3c. Bosch motor housing + rotating front chainring spider at bottom bracket
     ctx.fillStyle = '#182132';
     ctx.strokeStyle = '#384b6b';
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.ellipse(bbX, bbY, 15, 11, -0.2, 0, Math.PI * 2);
+    ctx.ellipse(bbX - 3, bbY, 16, 11.5, -0.18, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = '#121926';
+    ctx.strokeStyle = '#3e5478';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(bbX, bbY, chainringR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.strokeStyle = '#2f415e';
+    ctx.lineWidth = 1.4;
+    for (let arm = 0; arm < 5; arm++) {
+      const sa = crankAngleRad + (arm * Math.PI * 2) / 5;
+      ctx.beginPath();
+      ctx.moveTo(bbX, bbY);
+      ctx.lineTo(bbX + Math.cos(sa) * (chainringR - 1.5), bbY + Math.sin(sa) * (chainringR - 1.5));
+      ctx.stroke();
+    }
+
+    // 3d. Near-side (right) crank arm + horizontal platform pedal (in front of chainring)
+    const rPedalX = bbX + Math.cos(crankAngleRad) * crankLenPx;
+    const rPedalY = bbY + Math.sin(crankAngleRad) * crankLenPx;
+
+    ctx.strokeStyle = '#58739e';
+    ctx.lineWidth = 4.5;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(bbX, bbY);
+    ctx.lineTo(rPedalX, rPedalY);
+    ctx.stroke();
+
+    // Crank spindle bolt
+    ctx.fillStyle = '#7c96bf';
+    ctx.beginPath();
+    ctx.arc(bbX, bbY, 3, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Self-leveling horizontal platform pedal
+    ctx.fillStyle = '#1e2b42';
+    ctx.strokeStyle = '#7c96bf';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.roundRect(rPedalX - 7.5, rPedalY - 2.6, 15, 5.2, 1.8);
     ctx.fill();
     ctx.stroke();
 
@@ -1331,9 +1661,9 @@
     ctx.strokeStyle = '#3b4e70';
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.moveTo(saddleTopX - 18, saddleTopY);
-    ctx.quadraticCurveTo(saddleTopX + 2, saddleTopY + 5, saddleTopX + 22, saddleTopY + 1);
-    ctx.quadraticCurveTo(saddleTopX + 12, saddleTopY + 9, saddleTopX - 16, saddleTopY + 8);
+    ctx.moveTo(saddleTopX - 22, saddleTopY - 1);
+    ctx.quadraticCurveTo(saddleTopX + 2, saddleTopY + 5, saddleTopX + 27, saddleTopY);
+    ctx.quadraticCurveTo(saddleTopX + 14, saddleTopY + 11, saddleTopX - 19, saddleTopY + 9);
     ctx.closePath();
     ctx.fill();
     ctx.stroke();
@@ -1351,11 +1681,11 @@
     ctx.arc(stemTopX - 18, stemTopY - 4, 3.5, 0, Math.PI * 2);
     ctx.fill();
 
-    // 4. Load 75 Front Cargo Box (Right Side Panel)
-    const boxRearTop = { x: mx(1.26), y: my(0.69) };
-    const boxFrontTop = { x: mx(2.20), y: my(0.58) };
-    const boxFrontBot = { x: mx(2.13), y: my(0.30) };
-    const boxRearBot = { x: mx(1.30), y: my(0.265) };
+    // 4. Load 75 Front Cargo Box (Right Side Panel — ~0.94 m bottom rail matching STRIP_LENGTH_M)
+    const boxRearTop = { x: mx(1.24), y: my(0.69) };
+    const boxFrontTop = { x: mx(2.215), y: my(0.59) };
+    const boxFrontBot = { x: mx(2.19), y: my(0.30) };
+    const boxRearBot = { x: mx(1.25), y: my(0.265) };
 
     ctx.fillStyle = '#0f1624';
     ctx.strokeStyle = '#2c3c59';
@@ -1368,6 +1698,95 @@
     ctx.closePath();
     ctx.fill();
     ctx.stroke();
+
+    // Front arch frame tube & dark PCB strip channels (styled consistently with bike frame)
+    const archStartSide = { x: boxFrontBot.x - 1, y: boxFrontBot.y - 1 };
+    const archCtrlSide = { x: boxFrontBot.x + 5, y: my(0.46) };
+    const archCrownSide = { x: headTubeTopX, y: headTubeTopY };
+
+    ctx.strokeStyle = '#384b6b';
+    ctx.lineWidth = 5;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(archStartSide.x - 2, archStartSide.y);
+    ctx.quadraticCurveTo(archCtrlSide.x - 2, archCtrlSide.y, archCrownSide.x - 2, archCrownSide.y);
+    ctx.moveTo(headTubeTopX, headTubeTopY - 2);
+    ctx.lineTo(headTubeBotX, headTubeBotY);
+    ctx.stroke();
+
+    // Dark LED strip PCB backing channels along bottom of box and front arch
+    ctx.strokeStyle = '#0b0f18';
+    ctx.lineWidth = 4.5;
+    ctx.beginPath();
+    ctx.moveTo(boxRearBot.x + 2, boxRearBot.y + 2);
+    ctx.lineTo(boxFrontBot.x - 2, boxFrontBot.y + 2);
+    ctx.moveTo(archStartSide.x, archStartSide.y);
+    ctx.quadraticCurveTo(archCtrlSide.x, archCtrlSide.y, archCrownSide.x, archCrownSide.y);
+    ctx.stroke();
+
+    // Front headlight mounted on bracket ahead (+x) of the front arch LEDs + beam cone
+    const hlX = headTubeTopX + 9;
+    const hlY = headTubeTopY + 1;
+    const lensX = hlX + 12;
+    const lensY = hlY + 5.5;
+    const beamLenSide = Math.max(260, pxPerMeter * 1.75);
+
+    // Low-beam headlight cone projecting forward (+x) and illuminating the road ahead
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const sideConeGrad = ctx.createLinearGradient(lensX, lensY, lensX + beamLenSide, lensY + 40);
+    sideConeGrad.addColorStop(0, 'rgba(248, 252, 255, 0.38)');
+    sideConeGrad.addColorStop(0.32, 'rgba(226, 240, 255, 0.16)');
+    sideConeGrad.addColorStop(1, 'rgba(210, 232, 255, 0)');
+    ctx.fillStyle = sideConeGrad;
+    ctx.beginPath();
+    ctx.moveTo(lensX, lensY - 3.5);
+    ctx.lineTo(lensX + beamLenSide, lensY - 12); // Crisp StVZO upper beam cutoff
+    ctx.lineTo(lensX + beamLenSide, groundY + 34);
+    ctx.lineTo(lensX + pxPerMeter * 0.32, groundY + 12);
+    ctx.lineTo(lensX, lensY + 3.5);
+    ctx.closePath();
+    ctx.fill();
+
+    // Bright pool where the headlight cone strikes the pavement ahead of the front tire
+    const poolX = frontHubX + frontR + pxPerMeter * 0.55;
+    const poolGrad = ctx.createRadialGradient(poolX, groundY + 10, 4, poolX, groundY + 10, pxPerMeter * 0.65);
+    poolGrad.addColorStop(0, 'rgba(235, 246, 255, 0.22)');
+    poolGrad.addColorStop(1, 'rgba(235, 246, 255, 0)');
+    ctx.fillStyle = poolGrad;
+    ctx.beginPath();
+    ctx.ellipse(poolX, groundY + 10, pxPerMeter * 0.65, 16, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Subtle lens glow
+    const lensFlare = ctx.createRadialGradient(lensX, lensY, 1, lensX, lensY, 14);
+    lensFlare.addColorStop(0, 'rgba(255, 255, 255, 0.65)');
+    lensFlare.addColorStop(1, 'rgba(255, 255, 255, 0)');
+    ctx.fillStyle = lensFlare;
+    ctx.beginPath();
+    ctx.arc(lensX, lensY, 14, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // Mounting stem from headtube to headlight housing
+    ctx.strokeStyle = '#475e85';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(headTubeTopX + 2, headTubeTopY + 5);
+    ctx.lineTo(hlX + 1, hlY + 5.5);
+    ctx.stroke();
+
+    // Headlight cylindrical housing + bright front lens
+    ctx.fillStyle = '#141c2c';
+    ctx.strokeStyle = '#526b94';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.roundRect(hlX, hlY, 12, 11, 3.5);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(lensX - 1.5, hlY + 1.8, 2, 7.4);
 
     // Tubular spaceframe upper & middle rails on side of Load 75 box
     const midRear = {
@@ -1402,48 +1821,82 @@
     const stripFrontX = boxFrontBot.x - 4;
     const stripFrontY = boxFrontBot.y + 2;
     const stripSpanPx = Math.hypot(stripFrontX - stripRearX, stripFrontY - stripRearY);
-    const ledRadius = Math.max(1.6, Math.min(3.1, (stripSpanPx / count) * 0.65));
+    const ledSpacing = stripSpanPx / count;
+    const ledRadius = Math.max(1.9, Math.min(3.0, ledSpacing * 0.95));
 
+    // Underglow reflection cast onto the road directly beneath the bottom-mounted strip
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
-
-    // Subtle underglow reflection cast onto the road directly beneath the bottom-mounted strip
-    for (let i = 0; i < count; i += 6) {
+    for (let i = 0; i < count; i += 4) {
       const t = i / (count - 1);
       const x = stripRearX + (stripFrontX - stripRearX) * t;
       const bIdx = i * 3;
-      const r = rightStrip.bytes[bIdx];
-      const g = rightStrip.bytes[bIdx + 1];
-      const b = rightStrip.bytes[bIdx + 2];
+      const r = LED_DISPLAY_LUT[rightStrip.bytes[bIdx]];
+      const g = LED_DISPLAY_LUT[rightStrip.bytes[bIdx + 1]];
+      const b = LED_DISPLAY_LUT[rightStrip.bytes[bIdx + 2]];
       const maxCh = Math.max(r, g, b);
       if (maxCh > 8) {
-        const reflAlpha = (maxCh / 255) * 0.11;
-        const grad = ctx.createRadialGradient(x, groundY + 4, 2, x, groundY + 4, 34);
+        const reflAlpha = (maxCh / 255) * 0.16;
+        const grad = ctx.createRadialGradient(x, groundY + 4, 2, x, groundY + 4, 38);
         grad.addColorStop(0, `rgba(${r}, ${g}, ${b}, ${reflAlpha})`);
         grad.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
         ctx.fillStyle = grad;
         ctx.beginPath();
-        ctx.ellipse(x, groundY + 4, 34, 11, 0, 0, Math.PI * 2);
+        ctx.ellipse(x, groundY + 4, 38, 12, 0, 0, Math.PI * 2);
         ctx.fill();
       }
     }
+    ctx.restore();
 
+    const sideRightPts = [];
     for (let i = 0; i < count; i++) {
       // i = 0 (#0) at rear bulkhead -> i = 143 (#143) at front nose
       const t = i / (count - 1);
       const x = stripRearX + (stripFrontX - stripRearX) * t;
       const y = stripRearY + (stripFrontY - stripRearY) * t;
       const bIdx = i * 3;
-      drawGlowingPixel(
-        x,
-        y,
-        ledRadius,
-        rightStrip.bytes[bIdx],
-        rightStrip.bytes[bIdx + 1],
-        rightStrip.bytes[bIdx + 2]
-      );
+      const rr = rightStrip.bytes[bIdx];
+      const rg = rightStrip.bytes[bIdx + 1];
+      const rb = rightStrip.bytes[bIdx + 2];
+      sideRightPts.push({ x, y, r: rr, g: rg, b: rb, maxCh: Math.max(rr, rg, rb) });
     }
-    ctx.restore();
+    drawStripPoints(sideRightPts, ledRadius, 1.0);
+
+    // Second half of the 144-LED Front Arch Strip (ledsFront[72..143] on Pin D8; 0..71 are on the left side)
+    // Starts right next to ledsRight #143 (with ledsFront #143) and rises almost straight upward to #72 at the crown.
+    const frontCount = frontStrip.len;
+    const halfStart = Math.floor(frontCount / 2); // 72
+    const visibleArchLeds = frontCount - halfStart; // 72 LEDs (#72 .. #143)
+    const archSpanPx = Math.hypot(archCrownSide.x - archStartSide.x, archCrownSide.y - archStartSide.y);
+    const archLedRadius = Math.max(1.8, Math.min(2.8, (archSpanPx / visibleArchLeds) * 1.1));
+    const sideArchPts = [];
+
+    for (let k = 0; k < visibleArchLeds; k++) {
+      // k = 0 -> ledIdx 143 (right beside ledsRight #143 at bottom-front corner)
+      // k = 71 -> ledIdx 72 (top crown at headtube)
+      const u = k / Math.max(1, visibleArchLeds - 1);
+      const inv = 1 - u;
+      const ax = inv * inv * archStartSide.x + 2 * inv * u * archCtrlSide.x + u * u * archCrownSide.x;
+      const ay = inv * inv * archStartSide.y + 2 * inv * u * archCtrlSide.y + u * u * archCrownSide.y;
+      const ledIdx = frontCount - 1 - k;
+      const fIdx = ledIdx * 3;
+      const fr = frontStrip.bytes[fIdx];
+      const fg = frontStrip.bytes[fIdx + 1];
+      const fb = frontStrip.bytes[fIdx + 2];
+      sideArchPts.push({ x: ax, y: ay, r: fr, g: fg, b: fb, maxCh: Math.max(fr, fg, fb) });
+    }
+    drawStripPoints(sideArchPts, archLedRadius, 1.0);
+
+    ctx.fillStyle = '#52627a';
+    ctx.font = '9.5px ui-monospace, monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`#${halfStart}`, archCrownSide.x + 6, archCrownSide.y - 6);
+    ctx.fillText(`#${frontCount - 1}`, archStartSide.x + 7, archStartSide.y - 2);
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px ui-monospace, monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('ledsFront[72..143] · D8', archCtrlSide.x + 10, archCtrlSide.y - 6);
 
     // Strip endpoint & pin labels along bottom of cargo box
     ctx.fillStyle = '#52627a';
@@ -1510,21 +1963,22 @@
     drawChevronTurnStrip(rightSigX, rightSigY, +1, 20, '> D10', pwmRight, rightSigY + 28, 0.78);
   }
 
-  function drawLinearStripsLayout(w, h, leftStrip, rightStrip, pwmLeft, pwmRight) {
+  function drawLinearStripsLayout(w, h, leftStrip, rightStrip, frontStrip, pwmLeft, pwmRight) {
     const padX = 36;
     const usableW = Math.max(200, w - padX * 2);
     const count = leftStrip.len;
     const spacing = usableW / count;
     const radius = Math.max(1.6, Math.min(4.2, spacing * 0.46));
 
-    const yLeft = h * 0.27;
-    const yRight = h * 0.53;
+    const yLeft = h * 0.19;
+    const yFront = h * 0.41;
+    const yRight = h * 0.63;
 
     // Backing PCBs
     ctx.fillStyle = '#111622';
     ctx.strokeStyle = '#232e45';
     ctx.lineWidth = 1;
-    for (const y of [yLeft, yRight]) {
+    for (const y of [yLeft, yFront, yRight]) {
       ctx.beginPath();
       ctx.roundRect(padX - 10, y - 14, usableW + 20, 28, 6);
       ctx.fill();
@@ -1535,49 +1989,53 @@
     ctx.fillStyle = '#8b9bb4';
     ctx.font = '12px ui-monospace, monospace';
     ctx.textAlign = 'left';
-    ctx.fillText('Front Box Left:  ledsLeft[144]  — Pin D6 (WS2815 GRB)', padX - 6, yLeft - 24);
-    ctx.fillText('Front Box Right: ledsRight[144] — Pin D4 (WS2815 GRB)', padX - 6, yRight - 24);
+    ctx.fillText('Front Box Left:  ledsLeft[144]  — Pin D6 (WS2815 GRB)', padX - 6, yLeft - 22);
+    ctx.fillText('Front White Arch: ledsFront[144] — Pin D8 (WS2815 GRB)', padX - 6, yFront - 22);
+    ctx.fillText('Front Box Right: ledsRight[144] — Pin D4 (WS2815 GRB)', padX - 6, yRight - 22);
 
     ctx.fillStyle = '#52627a';
     ctx.font = '10px ui-monospace, monospace';
     ctx.textAlign = 'center';
     for (let tick = 0; tick < count; tick += 16) {
       const x = padX + (tick + 0.5) * spacing;
-      ctx.fillText(String(tick), x, yLeft + 28);
-      ctx.fillText(String(tick), x, yRight + 28);
+      ctx.fillText(String(tick), x, yLeft + 26);
+      ctx.fillText(String(tick), x, yFront + 26);
+      ctx.fillText(String(tick), x, yRight + 26);
     }
     const lastTickX = padX + (count - 0.5) * spacing;
-    ctx.fillText(String(count - 1), lastTickX, yLeft + 28);
-    ctx.fillText(String(count - 1), lastTickX, yRight + 28);
+    ctx.fillText(String(count - 1), lastTickX, yLeft + 26);
+    ctx.fillText(String(count - 1), lastTickX, yFront + 26);
+    ctx.fillText(String(count - 1), lastTickX, yRight + 26);
 
-    ctx.save();
-    ctx.globalCompositeOperation = 'lighter';
+    const linLeftPts = [];
+    const linFrontPts = [];
+    const linRightPts = [];
     for (let i = 0; i < count; i++) {
       const x = padX + (i + 0.5) * spacing;
       const bIdx = i * 3;
-      drawGlowingPixel(
-        x,
-        yLeft,
-        radius,
-        leftStrip.bytes[bIdx],
-        leftStrip.bytes[bIdx + 1],
-        leftStrip.bytes[bIdx + 2]
-      );
-      drawGlowingPixel(
-        x,
-        yRight,
-        radius,
-        rightStrip.bytes[bIdx],
-        rightStrip.bytes[bIdx + 1],
-        rightStrip.bytes[bIdx + 2]
-      );
+      const lr = leftStrip.bytes[bIdx];
+      const lg = leftStrip.bytes[bIdx + 1];
+      const lb = leftStrip.bytes[bIdx + 2];
+      linLeftPts.push({ x, y: yLeft, r: lr, g: lg, b: lb, maxCh: Math.max(lr, lg, lb) });
+
+      const fr = frontStrip.bytes[bIdx];
+      const fg = frontStrip.bytes[bIdx + 1];
+      const fb = frontStrip.bytes[bIdx + 2];
+      linFrontPts.push({ x, y: yFront, r: fr, g: fg, b: fb, maxCh: Math.max(fr, fg, fb) });
+
+      const rr = rightStrip.bytes[bIdx];
+      const rg = rightStrip.bytes[bIdx + 1];
+      const rb = rightStrip.bytes[bIdx + 2];
+      linRightPts.push({ x, y: yRight, r: rr, g: rg, b: rb, maxCh: Math.max(rr, rg, rb) });
     }
-    ctx.restore();
+    drawStripPoints(linLeftPts, radius, 1.0);
+    drawStripPoints(linFrontPts, radius, 1.0);
+    drawStripPoints(linRightPts, radius, 1.0);
 
     // Rear rack < and > chevron turn strips below
-    const lampY = h * 0.81;
-    drawChevronTurnStrip(w * 0.36, lampY, -1, 28, 'Rear Rack Left < · D9', pwmLeft);
-    drawChevronTurnStrip(w * 0.64, lampY, +1, 28, 'Rear Rack Right > · D10', pwmRight);
+    const lampY = h * 0.85;
+    drawChevronTurnStrip(w * 0.36, lampY, -1, 26, 'Rear Rack Left < · D9', pwmLeft);
+    drawChevronTurnStrip(w * 0.64, lampY, +1, 26, 'Rear Rack Right > · D10', pwmRight);
   }
 
   function updateTelemetryUI(pwmLeft, pwmRight, estMph) {
@@ -1600,9 +2058,9 @@
     pinEls[3].textContent = d3 === 0 ? 'LOW (Pressed)' : 'HIGH (Idle)';
     pinEls[3].className = `pin-val ${d3 === 0 ? 'low' : 'high'}`;
 
-    const d7 = api.getPinDigital(PINS.HALL_SENSOR);
-    pinEls[7].textContent = d7 === 0 ? 'LOW (Magnet!)' : 'HIGH (Clear)';
-    pinEls[7].className = `pin-val ${d7 === 0 ? 'low' : 'high'}`;
+    const hallActive = hallTriggeredThisFrame || api.getPinDigital(PINS.HALL_SENSOR) === 0;
+    pinEls[7].textContent = hallActive ? 'LOW (Magnet!)' : 'HIGH (Clear)';
+    pinEls[7].className = `pin-val ${hallActive ? 'low' : 'high'}`;
 
     pinEls[9].textContent = `PWM ${pwmLeft} (${Math.round((pwmLeft / 255) * 100)}%)`;
     pinEls[9].className = `pin-val ${pwmLeft > 0 ? 'low' : 'high'}`;
@@ -1618,12 +2076,13 @@
 
     const leftStrip = readStripBytes(PINS.LEFT_STRIP);
     const rightStrip = readStripBytes(PINS.RIGHT_STRIP);
+    const frontStrip = readStripBytes(PINS.FRONT_STRIP);
     const pwmLeft = api.getPinAnalog(PINS.REAR_LEFT_PWM);
     const pwmRight = api.getPinAnalog(PINS.REAR_RIGHT_PWM);
-    const hallLow = api.getPinDigital(PINS.HALL_SENSOR) === 0;
+    const hallLow = hallTriggeredThisFrame || api.getPinDigital(PINS.HALL_SENSOR) === 0;
     const estMph = api.getEstimatedVelocityMph ? api.getEstimatedVelocityMph() : 0;
 
-    const mode = layoutSelect.value;
+    const mode = currentLayout;
     const { bikeCx, bikeCy } = getBikeViewportMetrics(w, h, mode);
     const bounds = getVisibleWorldBounds(w, h, bikeCx, bikeCy);
 
@@ -1633,11 +2092,11 @@
     ctx.translate(-bikeCx, -bikeCy);
 
     if (mode === 'strips') {
-      drawLinearStripsLayout(w, h, leftStrip, rightStrip, pwmLeft, pwmRight);
+      drawLinearStripsLayout(w, h, leftStrip, rightStrip, frontStrip, pwmLeft, pwmRight);
     } else if (mode === 'side') {
-      drawBikeSideLayout(w, h, rightStrip, pwmLeft, pwmRight, hallLow, bounds);
+      drawBikeSideLayout(w, h, rightStrip, frontStrip, pwmLeft, pwmRight, hallLow, bounds);
     } else {
-      drawBikeLayout(w, h, leftStrip, rightStrip, pwmLeft, pwmRight, hallLow, bounds);
+      drawBikeLayout(w, h, leftStrip, rightStrip, frontStrip, pwmLeft, pwmRight, hallLow, bounds);
     }
     ctx.restore();
 
@@ -1700,7 +2159,7 @@
     const rect = canvas.getBoundingClientRect();
     const w = Math.max(1, rect.width);
     const h = Math.max(1, rect.height);
-    const { maxFitZoom } = getBikeViewportMetrics(w, h, layoutSelect.value);
+    const { maxFitZoom } = getBikeViewportMetrics(w, h, currentLayout);
 
     // If zoomed in so the bike exceeds the viewport, smoothly zoom back out once gesture relaxes
     const wheelIdle = nowWall - lastWheelZoomWall > 90;

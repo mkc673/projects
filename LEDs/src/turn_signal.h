@@ -10,7 +10,7 @@ const int MODE_FADE_IN = 0;
 const int MODE_FULL = 1;
 const int MODE_FADE_OUT = 2;
 const int MODE_OFF = 3;
-int DURATIONS[] = {
+constexpr int DURATIONS[] = {
     60,
     250,
     256,
@@ -90,6 +90,6 @@ void TurnSignal::render()
         // fill_solid(leds, numLeds, 0);
         break;
     }
-    FastLED.setBrightness(value);
+    fill_solid(leds, numLeds, CHSV(HUE_ORANGE - 10, 255, value));
     analogWrite(signalPin, value);
 }

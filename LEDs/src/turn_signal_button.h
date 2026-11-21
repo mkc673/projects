@@ -28,7 +28,7 @@ class TurnSignalButton {
                 stableState = reading;
                 // INPUT_PULLUP: pressed == LOW
                 if (stableState == LOW) {
-                    Serial.println("Button pressed");
+                    Serial.println(F("Button pressed"));
                     if (callback) callback();
                 }
             }

@@ -9,7 +9,7 @@ struct LightState {
     CHSV color;
 };
 
-LightState interpolate(const LightState& state1, const LightState& state2, float t) {
+inline LightState interpolate(const LightState& state1, const LightState& state2, float t) {
     LightState result;
     result.start = state1.start + (state2.start - state1.start) * t;
     result.length = state1.length + (state2.length - state1.length) * t;
